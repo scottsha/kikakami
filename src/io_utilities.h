@@ -1,15 +1,24 @@
-#ifndef PACKNSMASH_IO_UTILITIES_H
-#define PACKNSMASH_IO_UTILITIES_H
+#ifndef KIKAKAMI_IO_UTILITIES_H
+#define KIKAKAMI_IO_UTILITIES_H
 
 #include <filesystem>
-#include <vector>
 
-#include "eigen_triangulation.h"
+#include "vtkDataSet.h"
+#include "vtkPolyData.h"
+#include "vtkUnstructuredGrid.h"
 
-namespace pack_n_smash {
+#include "eigenmesh.h"
 
-    std::vector<EigenTriangulation> read_triangulations(const std::filesystem::path& path);
+namespace kikakami {
 
-};
+void write_mesh(const vtkSmartPointer<vtkDataSet>& mesh, const std::filesystem::path& fout_path);
 
-#endif //PACKNSMASH_IO_UTILITIES_H
+auto read_to_eigenmesh(const std::filesystem::path& fin_path) -> EigenTriangleMesh;
+
+auto read_to_triangulated_polydata(const std::filesystem::path& fin_path) -> vtkSmartPointer<vtkPolyData>;
+
+auto read_to_bool_tagged_mesh(const std::filesystem::path& mesh_path) -> vtkSmartPointer<vtkUnstructuredGrid>;
+
+} // namespace kikakami
+
+#endif // KIKAKAMI_IO_UTILITIES_H
