@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+rm -rf build
+
+conan install --build=missing . -s=build_type=Debug
+cmake -G Ninja -DCMAKE_TOOLCHAIN_FILE=./build/Debug/generators/conan_toolchain.cmake -DCMAKE_BUILD_TYPE=DEBUG -B ./build/Debug
+cmake --build ./build/Debug
+
+conan install --build=missing . -s=build_type=Release
+cmake -G Ninja -DCMAKE_TOOLCHAIN_FILE=./build/Release/generators/conan_toolchain.cmake -DCMAKE_BUILD_TYPE=RELEASE -B ./build/Release
+cmake --build ./build/Release
