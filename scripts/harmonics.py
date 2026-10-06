@@ -79,20 +79,103 @@ def build_dirichlet_operator(mesh: pv.PolyData) -> LinearOperator:
 
 
 
-def compute_boundary_dirichlet_modes(mesh: pv.PolyData, num_modes: int) -> Eigenstructure:
+import os
+
+def compute_boundary_dirichlet_modes(mesh: pv.PolyData, num_modes: int, sigma: float = None) -> Eigenstructure:
     operator = build_dirichlet_operator(mesh)
+    
+    kwargs = {"k": num_modes, "M": operator.support_mass}
+    if sigma is not None:
+        kwargs["sigma"] = sigma
+        kwargs["which"] = "LM"
+    else:
+        kwargs["which"] = "SM"
+        
+    print(f"Computing {num_modes} modes on {mesh.n_points} vertices.")
     eigenvalues, waves_supported = sp.sparse.linalg.eigs(
         operator.matrix,
-        k=num_modes,
-        M=operator.support_mass,
-        which="SM")
+        **kwargs)
+        
     waves_prenormalized = np.zeros(shape=(mesh.n_points, num_modes))
     waves_prenormalized[operator.support_indices, :] = waves_supported.real
     linf_norms = np.linalg.norm(waves_prenormalized, ord=np.inf, axis=0, keepdims=True)
     waves_presigned = waves_prenormalized / linf_norms
     waves = cannonicalize_mode_signs(mesh, waves_presigned)
-    eigenstructure = Eigenstructure(eigenvalues=np.real(eigenvalues),eigenvectors=waves)
+    eigenstructure = Eigenstructure(eigenvalues=np.real(eigenvalues), eigenvectors=waves)
     return eigenstructure
+
+def get_cached_boundary_dirichlet_modes(mesh: pv.PolyData, num_modes: int) -> Eigenstructure:
+    cache_file = "linear_operator_spectrum.npz"
+    cached_evals = None
+    cached_evecs = None
+    
+    if os.path.exists(cache_file):
+        try:
+            with np.load(cache_file) as data:
+                if data["number_of_cells"] == mesh.n_cells and data["number_of_vertices"] == mesh.n_points:
+                    cached_evals = data["spectrum"]
+                    cached_evecs = data["eigenvectors"]
+        except Exception as e:
+            print(f"Cache load failed: {e}")
+
+    if cached_evals is not None and cached_evecs is not None:
+        num_cached = len(cached_evals)
+        if num_cached >= num_modes:
+            print("Loaded eigenstructure from cache.")
+            return Eigenstructure(
+                eigenvalues=cached_evals[:num_modes],
+                eigenvectors=cached_evecs[:, :num_modes]
+            )
+        else:
+            k_needed = num_modes - num_cached
+            print(f"Cache partially satisfied. Have {num_cached}, need {num_modes}. Computing {k_needed} more modes...")
+            
+            top_cached = float(np.max(cached_evals))
+            new_struct = compute_boundary_dirichlet_modes(mesh, num_modes=k_needed, sigma=top_cached)
+            
+            all_evals = np.concatenate([cached_evals, new_struct.eigenvalues])
+            all_evecs = np.hstack([cached_evecs, new_struct.eigenvectors])
+            
+            sort_idx = np.argsort(all_evals)
+            all_evals = all_evals[sort_idx]
+            all_evecs = all_evecs[:, sort_idx]
+            
+            unique_mask = np.ones(len(all_evals), dtype=bool)
+            for i in range(1, len(all_evals)):
+                for j in range(i-1, -1, -1):
+                    if np.abs(all_evals[i] - all_evals[j]) > 1e-5:
+                        break
+                    if unique_mask[j]:
+                        mode_i = all_evecs[:, i]
+                        mode_j = all_evecs[:, j]
+                        dot_prod = np.abs(np.dot(mode_i, mode_j))
+                        norm_sq_j = np.dot(mode_j, mode_j)
+                        if np.abs(dot_prod - norm_sq_j) < 1e-4 * norm_sq_j:
+                            unique_mask[i] = False
+                            break
+                            
+            final_evals = all_evals[unique_mask]
+            final_evecs = all_evecs[:, unique_mask]
+            
+            np.savez(cache_file,
+                     number_of_cells=mesh.n_cells,
+                     number_of_vertices=mesh.n_points,
+                     spectrum=final_evals,
+                     eigenvectors=final_evecs)
+            
+            return Eigenstructure(
+                eigenvalues=final_evals[:num_modes],
+                eigenvectors=final_evecs[:, :num_modes]
+            )
+            
+    print("Computing eigenstructure from scratch...")
+    struct = compute_boundary_dirichlet_modes(mesh, num_modes=num_modes)
+    np.savez(cache_file,
+             number_of_cells=mesh.n_cells,
+             number_of_vertices=mesh.n_points,
+             spectrum=struct.eigenvalues,
+             eigenvectors=struct.eigenvectors)
+    return struct
 
 
 def interpolated_mode(eig: Eigenstructure, relative_eigenmode: float) -> np.ndarray:
@@ -162,13 +245,13 @@ def rescale_range(xx: np.ndarray, range_low: float, range_hi:float) -> np.ndarra
 
 def test_cyl_0():
     mesh = pv.read("rook.obj")
-    num_modes = 128
+    num_modes = 256
     big_width = 5.0
     min_thickness = 0.6
     collar_guarantee_size = 0.35
     survival_level = 0.3
 
-    eigenstructure = compute_boundary_dirichlet_modes(mesh, num_modes)
+    eigenstructure = get_cached_boundary_dirichlet_modes(mesh, num_modes)
     waves = eigenstructure.eigenvectors
     ground_state = np.abs(waves[:, 0])
     mesh.point_data["ground_state"] = ground_state
