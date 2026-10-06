@@ -6,6 +6,7 @@ import pyvista as pv
 import vtk
 import scipy as sp
 from dataclasses import dataclass
+import os
 
 
 def compute_moment_frame(mesh: pv.PolyData) -> np.ndarray:
@@ -38,11 +39,11 @@ def compute_moment_frame(mesh: pv.PolyData) -> np.ndarray:
     return sorted_eigenvectors
 
 
-def cannonicalize_mode_signs(mesh: pv.PolyData, modes: np.ndarray) -> np.ndarray:
+def canonicalize_mode_signs(mesh: pv.PolyData, modes: np.ndarray) -> np.ndarray:
     frame = compute_moment_frame(mesh)
     centered = mesh.points - mesh.points.mean(axis=0)
     cannon_coords = centered @ frame
-    test_function = 1/(1+np.exp(1-cannon_coords @ np.array([np.pi, np.sqrt(2), 1])))
+    test_function = 1 / (1 + np.exp(1 - cannon_coords @ np.array([np.pi, np.sqrt(2), 1])))
     triangle_vertices = mesh.faces.reshape((-1, 4))[:, 1:]
     mass = igl.massmatrix(mesh.points, triangle_vertices)
     signs = np.sign(test_function.transpose() @ mass @ modes)
@@ -59,7 +60,7 @@ class Eigenstructure:
 @dataclass
 class LinearOperator:
     support_indices: list[int]
-    matrix:  sp.sparse.spmatrix
+    matrix: sp.sparse.spmatrix
     support_mass: sp.sparse.spmatrix
 
 
@@ -77,38 +78,35 @@ def build_dirichlet_operator(mesh: pv.PolyData) -> LinearOperator:
     return linear_operator
 
 
-
-
-import os
-
 def compute_boundary_dirichlet_modes(mesh: pv.PolyData, num_modes: int, sigma: float = None) -> Eigenstructure:
     operator = build_dirichlet_operator(mesh)
-    
+
     kwargs = {"k": num_modes, "M": operator.support_mass}
     if sigma is not None:
         kwargs["sigma"] = sigma
         kwargs["which"] = "LM"
     else:
         kwargs["which"] = "SM"
-        
+
     print(f"Computing {num_modes} modes on {mesh.n_points} vertices.")
     eigenvalues, waves_supported = sp.sparse.linalg.eigs(
         operator.matrix,
         **kwargs)
-        
+
     waves_prenormalized = np.zeros(shape=(mesh.n_points, num_modes))
     waves_prenormalized[operator.support_indices, :] = waves_supported.real
     linf_norms = np.linalg.norm(waves_prenormalized, ord=np.inf, axis=0, keepdims=True)
     waves_presigned = waves_prenormalized / linf_norms
-    waves = cannonicalize_mode_signs(mesh, waves_presigned)
+    waves = canonicalize_mode_signs(mesh, waves_presigned)
     eigenstructure = Eigenstructure(eigenvalues=np.real(eigenvalues), eigenvectors=waves)
     return eigenstructure
+
 
 def get_cached_boundary_dirichlet_modes(mesh: pv.PolyData, num_modes: int) -> Eigenstructure:
     cache_file = "linear_operator_spectrum.npz"
     cached_evals = None
     cached_evecs = None
-    
+
     if os.path.exists(cache_file):
         try:
             with np.load(cache_file) as data:
@@ -129,20 +127,20 @@ def get_cached_boundary_dirichlet_modes(mesh: pv.PolyData, num_modes: int) -> Ei
         else:
             k_needed = num_modes - num_cached
             print(f"Cache partially satisfied. Have {num_cached}, need {num_modes}. Computing {k_needed} more modes...")
-            
+
             top_cached = float(np.max(cached_evals))
             new_struct = compute_boundary_dirichlet_modes(mesh, num_modes=k_needed, sigma=top_cached)
-            
+
             all_evals = np.concatenate([cached_evals, new_struct.eigenvalues])
             all_evecs = np.hstack([cached_evecs, new_struct.eigenvectors])
-            
+
             sort_idx = np.argsort(all_evals)
             all_evals = all_evals[sort_idx]
             all_evecs = all_evecs[:, sort_idx]
-            
+
             unique_mask = np.ones(len(all_evals), dtype=bool)
             for i in range(1, len(all_evals)):
-                for j in range(i-1, -1, -1):
+                for j in range(i - 1, -1, -1):
                     if np.abs(all_evals[i] - all_evals[j]) > 1e-5:
                         break
                     if unique_mask[j]:
@@ -153,21 +151,21 @@ def get_cached_boundary_dirichlet_modes(mesh: pv.PolyData, num_modes: int) -> Ei
                         if np.abs(dot_prod - norm_sq_j) < 1e-4 * norm_sq_j:
                             unique_mask[i] = False
                             break
-                            
+
             final_evals = all_evals[unique_mask]
             final_evecs = all_evecs[:, unique_mask]
-            
+
             np.savez(cache_file,
                      number_of_cells=mesh.n_cells,
                      number_of_vertices=mesh.n_points,
                      spectrum=final_evals,
                      eigenvectors=final_evecs)
-            
+
             return Eigenstructure(
                 eigenvalues=final_evals[:num_modes],
                 eigenvectors=final_evecs[:, :num_modes]
             )
-            
+
     print("Computing eigenstructure from scratch...")
     struct = compute_boundary_dirichlet_modes(mesh, num_modes=num_modes)
     np.savez(cache_file,
@@ -179,7 +177,7 @@ def get_cached_boundary_dirichlet_modes(mesh: pv.PolyData, num_modes: int) -> Ei
 
 
 def interpolated_mode(eig: Eigenstructure, relative_eigenmode: float) -> np.ndarray:
-    est_eigenmode = (1-relative_eigenmode) * eig.eigenvalues[0] + relative_eigenmode * eig.eigenvalues[-1]
+    est_eigenmode = (1 - relative_eigenmode) * eig.eigenvalues[0] + relative_eigenmode * eig.eigenvalues[-1]
     decay_rate = 0.5 * np.square(eig.eigenvalues.size / (eig.eigenvalues[-1] - eig.eigenvalues[0]))
     print("DECAY RATE:", decay_rate)
     weights = np.exp(-decay_rate * np.square(eig.eigenvalues - est_eigenmode))
@@ -189,9 +187,14 @@ def interpolated_mode(eig: Eigenstructure, relative_eigenmode: float) -> np.ndar
     return mode
 
 
-def weyl_estimate(full_cotan, full_mass) -> float:
-    # Weyl estimate lambda_N ~ 4pi/A N + lambda_0
-    return 0.0
+def weyl_estimate(area: float, boundary_length: float, nth_mode: int) -> float:
+    # Weyl says the lambda_N \approx \frac{4\pi N}{A} + \frac{2\sqrt{\pi} L}{A^{3/2}} \sqrt{N}
+    return 4 * np.pi / area * nth_mode + 2 * np.sqrt(np.pi) * np.pow(area, -1.5) * boundary_length * np.sqrt(nth_mode)
+
+
+def weyl_gap_estimate(area: float, boundary_length: float, nth_mode: int) -> float:
+    # Derivative of the Weyl estimate says dlambda_N \approx \frac{4\pi}{A} + \frac{2\sqrt{\pi} L}{A^{3/2}} \sqrt{N}
+    return 4 * np.pi / area + np.sqrt(np.pi) * np.pow(area, -1.5) * boundary_length / np.sqrt(nth_mode)
 
 
 def extrude_triangles_to_wedges(mesh: pv.PolyData, offset_field_name: str, min_thickness: float = None) -> pv.PolyData:
@@ -218,12 +221,12 @@ def extrude_triangles_to_wedges(mesh: pv.PolyData, offset_field_name: str, min_t
     cell_types = np.full(n_cells, vtk.VTK_WEDGE, dtype=np.uint8)
 
     ugrid = pv.UnstructuredGrid(cells, cell_types, all_points)
-    ugrid.point_data[offset_field_name] = np.vstack([offset[:,None], offset[:,None]])
+    ugrid.point_data[offset_field_name] = np.vstack([offset[:, None], offset[:, None]])
     if min_thickness is not None:
         thresholded = ugrid.clip_scalar(
             value=min_thickness,
             scalars=offset_field_name,
-            invert=False,)
+            invert=False, )
         return thresholded.extract_surface(algorithm='geometry')
     return ugrid.extract_surface(algorithm='geometry')
 
@@ -235,17 +238,17 @@ def test_extrusion():
     zounds.save("zounds.vtp")
 
 
-def rescale_range(xx: np.ndarray, range_low: float, range_hi:float) -> np.ndarray:
+def rescale_range(xx: np.ndarray, range_low: float, range_hi: float) -> np.ndarray:
     low_xx = xx.min()
     high_xx = xx.max()
     slope = (range_hi - range_low) / (high_xx - low_xx)
-    rescaled =  slope * (xx - low_xx) + range_low
+    rescaled = slope * (xx - low_xx) + range_low
     return rescaled
 
 
 def test_cyl_0():
     mesh = pv.read("rook.obj")
-    num_modes = 256
+    num_modes = 456
     big_width = 5.0
     min_thickness = 0.6
     collar_guarantee_size = 0.35
@@ -257,7 +260,7 @@ def test_cyl_0():
     mesh.point_data["ground_state"] = ground_state
     base_tone = np.sqrt(np.abs(waves[:, 0]))
     # base_tone = np.abs(waves[:, 0])
-    waist_coat = big_width * (1-0.5*base_tone)
+    waist_coat = big_width * (1 - 0.5 * base_tone)
     mesh.point_data["waist_coat"] = waist_coat
     # ww0 = rescale_range(interpolated_mode(eigenstructure, 0.8514231), -1, 1)
     ww0 = eigenstructure.eigenvectors[:, 89]
@@ -286,8 +289,6 @@ def test_cyl_0():
     mesh.save("quilt.vtp")
     extruded = extrude_triangles_to_wedges(mesh, offset_field_name="height", min_thickness=min_thickness)
     extruded.save("waved.vtp")
-
-
 
 
 if __name__ == "__main__":
