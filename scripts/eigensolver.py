@@ -25,15 +25,15 @@ class SpectralShiftFactorizer:
                     self.backend = "splu"
         print(f"[SpectralShiftFactorizer] backend = {self.backend}")
 
-    def set_shift(self, spectral_shift):
-        S = (self.A - spectral_shift * self.I).tocsc()
+    def set_shift(self, spectral_target):
+        S = (self.A - spectral_target * self.I).tocsc()
 
         if self.backend == "cholmod":
             from sksparse.cholmod import analyze
             # SPD when sigma < 0 -> fast supernodal LL^T.
             # Indefinite when sigma > 0 -> simplicial LDL^T (no pivoting; fine near-shift
             # for most meshes, use PARDISO if you see instability).
-            mode = "supernodal" if spectral_shift < 0 else "simplicial"
+            mode = "supernodal" if spectral_target < 0 else "simplicial"
             if mode not in self._factors:
                 self._factors[mode] = analyze(S, mode=mode)   # symbolic: done once per mode
             f = self._factors[mode]
@@ -67,13 +67,13 @@ class SpectralShiftEigenSolver:
         self.factorizer = SpectralShiftFactorizer(self.symmetrized_operator, backend)
         self._v0 = None
 
-    def solve(self, sigma, k=7, tol=1e-6, ncv=None, warm_start=True):
-        if sigma == 0.0:
-            sigma = 1e-6
-        self.factorizer.set_shift(sigma)
+    def solve(self, spectral_target, k=7, tol=1e-6, ncv=None, warm_start=True):
+        if spectral_target == 0.0:
+            spectral_target = 1e-6
+        self.factorizer.set_shift(spectral_target)
         ncv = ncv or max(2 * k + 1, 16)
         vals, vecs = spla.eigsh(
-            self.symmetrized_operator, k=k, sigma=sigma, which="LM",
+            self.symmetrized_operator, k=k, sigma=spectral_target, which="LM",
             OPinv=self.factorizer.as_linear_operator(),
             tol=tol, ncv=ncv,
             v0=self._v0 if warm_start else None,

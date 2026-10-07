@@ -16,7 +16,7 @@ def fast_cpu_lobpcg_shifted(matrix, mass, spectral_shift, num_modes):
     inverse_resolvant = matrix - spectral_shift * mass
     ml = pyamg.smoothed_aggregation_solver(inverse_resolvant.tocsr())
     preconditioner = ml.aspreconditioner()
-    initial_state = 1+np.random.rand(matrix.shape[0], num_modes)
+    initial_state = 1 + np.random.rand(matrix.shape[0], num_modes)
     vals, vecs = spla.lobpcg(matrix, initial_state, B=mass, M=preconditioner, largest=False, tol=1e-4, maxiter=500)
     return vals, vecs
 
@@ -218,7 +218,7 @@ def weyl_gap_estimate(area: float, boundary_length: float, nth_mode: float) -> f
     return 4 * np.pi / area + np.sqrt(np.pi) * np.pow(area, -1.5) * boundary_length / np.sqrt(nth_mode)
 
 
-def extrude_triangles_to_wedges(mesh: pv.PolyData, offset_field_name: str, min_thickness: float = None) -> pv.PolyData:
+def extrude_triangles_to_wedges(mesh: pv.PolyData, offset_field_name: str, min_thickness: float = None, smoothing_iterations=0) -> pv.PolyData:
     """Extrude each triangle of an all-triangle mesh into a vtkWedge.
 
     Each vertex at x0 is paired with an extruded vertex at
@@ -248,8 +248,10 @@ def extrude_triangles_to_wedges(mesh: pv.PolyData, offset_field_name: str, min_t
             value=min_thickness,
             scalars=offset_field_name,
             invert=False, )
-        return thresholded.extract_surface(algorithm='geometry')
-    return ugrid.extract_surface(algorithm='geometry')
+        surface = thresholded.extract_surface(algorithm='geometry')
+    else:
+        surface = ugrid.extract_surface(algorithm='geometry')
+    return surface
 
 
 def rescale_range(xx: np.ndarray, range_low: float, range_hi: float) -> np.ndarray:
@@ -279,6 +281,7 @@ class WaveGenerator:
         boundary_edges = boundary_edges.compute_cell_sizes()
         self.boundary_measure = boundary_edges["Length"].sum()
         self.operator = build_dirichlet_operator(mesh)
+        self.solver = SpectralShiftEigenSolver(self.operator.matrix, self.operator.support_mass)
 
     def supported_to_full_field(self, supported_field: np.ndarray) -> np.ndarray:
         full_shape = list(supported_field.shape)
@@ -287,131 +290,107 @@ class WaveGenerator:
         field[self.operator.support_indices, :] = supported_field
         return field
 
+    def sign_by_skewness(self, modes: np.ndarray) -> np.ndarray:
+        skewness =  (self.operator.support_mass @ np.power(modes, 3)).sum(axis=0)
+        print(f"Skewness: {skewness}")
+        signs = np.sign(skewness)
+        print(f"signs: {signs}")
+        signed_modes = modes * signs
+        return signed_modes
+
     def generate_ground_mode(self) -> np.ndarray:
-        # ground_energy, ground_state_complex = sp.sparse.linalg.eigs(
-        #     self.operator.matrix,
-        #     k=1,
-        #     M=self.operator.support_mass,
-        #     which="SM")
-        ground_energy, ground_state_complex = fast_cpu_lobpcg_shifted(
-            matrix=self.operator.matrix,
-            mass=self.operator.support_mass,
-            spectral_shift=0.0,
-            num_modes=1
-        )
-        ground_state = ground_state_complex.real
-        if ground_state.sum() < 0:
-            ground_state *= -1
-        ground_state_rescaled = rescale_range(self.supported_to_full_field(ground_state),
+        ground_eig, ground_mode = self.solver.solve(1e-6, k=1)
+        if ground_mode.sum() < 0:
+            ground_mode *= -1
+        ground_state_rescaled = rescale_range(self.supported_to_full_field(ground_mode),
                                               0.0,
                                               1.0)
         return ground_state_rescaled
 
-    def generate_wave(self, mode_rank: float) -> np.ndarray:
-        spectral_shift = weyl_estimate(self.area, self.boundary_measure, mode_rank)
-        eigenvalues_complex, modes_complex = fast_cpu_lobpcg_shifted(
-            self.operator.matrix,
-            mass=self.operator.support_mass,
-            spectral_shift=spectral_shift,
-            num_modes=7,
-        )
-        eigenvalues = eigenvalues_complex.real
-        modes = rescale_range_per_column(modes_complex.real, -1.0, 1.0)
-        #TODO canonicalize the mode signs
-        weyl_gap = weyl_gap_estimate(self.area, self.boundary_measure, mode_rank)
-        decay_rate = -1.0 / (weyl_gap * weyl_gap)
-        weights_prenormalized = np.exp(decay_rate * np.square((eigenvalues - spectral_shift)))
-        weights = weights_prenormalized / np.sum(weights_prenormalized)
-        print(f"eigenvalues: {eigenvalues}")
-        print(f"weyl_gap: {weyl_gap}")
-        print(f"Weights: {weights}")
-        wave_prenormalized = modes @ weights
-        wave = rescale_range(wave_prenormalized, -1.0, 1.0)
-        return self.supported_to_full_field(wave)
-
     def generate_pure_mode(self, mode_rank: float) -> np.ndarray:
         spectral_shift = weyl_estimate(self.area, self.boundary_measure, mode_rank)
-        eigenvalues_complex, modes_complex =fast_cpu_lobpcg_shifted(
-            self.operator.matrix,
-            num_modes=1,
-            mass=self.operator.support_mass,
-            spectral_shift=spectral_shift)
-        #TODO canonicalize the mode signs
-        mode = rescale_range_per_column(modes_complex.real, -1.0, 1.0)
-        return self.supported_to_full_field(mode)
+        eigenvalues_complex, modes = self.solver.solve(spectral_shift, k=1)
+        # TODO canonicalize the mode signs
+        mode = rescale_range(modes, -1.0, 1.0)
+        signed_mode = self.sign_by_skewness(mode)
+        return self.supported_to_full_field(signed_mode)
 
+    def generate_wave(self, mode_rank: float) -> np.ndarray:
+        spectral_target = weyl_estimate(self.area, self.boundary_measure, mode_rank)
+        eigenvalues, modes_raw = self.solver.solve(spectral_target, k=7)
+        modes = rescale_range_per_column(modes_raw, -1.0, 1.0)
+        modes = self.sign_by_skewness(modes)
+        # TODO canonicalize the mode signs
+        weyl_gap = weyl_gap_estimate(self.area, self.boundary_measure, mode_rank)
+        print(f"spectral_target: {spectral_target}")
+        off_target = (eigenvalues - spectral_target)
+        print(f"eigenvalues: {eigenvalues}")
+        print(f"weyl_gap: {weyl_gap}")
+        print(f"off_target: {off_target}")
+        weights_prenormalized = np.exp(-1.5 * np.square(off_target / weyl_gap))
+        weights = weights_prenormalized / np.sum(weights_prenormalized)
+        print(f"Weights: {weights}")
+        wave_prenormalized = modes @ weights[:, np.newaxis]
+        wave = rescale_range(wave_prenormalized, -1.0, 1.0)
+        return self.supported_to_full_field(wave)
 
 
 def test_generator():
     mesh = pv.read("rook.obj")
     gen = WaveGenerator(mesh)
-    # ground_state = gen.generate_ground_mode()
-    # mesh.point_data["ground_state"] = ground_state
+    ground_state = gen.generate_ground_mode()
+    mesh.point_data["ground_state"] = ground_state
     wave89 = gen.generate_wave(89)
     mesh.point_data["wave89"] = wave89
-    # pure89 = gen.generate_pure_mode(89)
-    # mesh.point_data["pure89"] = pure89
+    pure89 = gen.generate_pure_mode(89)
+    mesh.point_data["pure89"] = pure89
+    wave1889 = gen.generate_wave(1889)
+    mesh.point_data["wave1889"] = wave1889
+    pure1889 = gen.generate_pure_mode(1889)
+    mesh.point_data["pure1889"] = pure1889
     mesh.save("generated.vtp")
 
 
-
-def test_cyl_0():
-    mesh = pv.read("rook.obj")
-    num_modes = 300
-    big_width = 5.0
-    min_thickness = 0.6
-    collar_guarantee_size = 0.35
+def wave_to_rook(
+    mesh: pv.PolyData,
+    ground_state: np.ndarray,
+    wave: np.ndarray,
+    smoothing_iterations=20,
+    big_width=5.0,
+    min_thickness = 0.4,
+    collar_guarantee_size = 0.35,
     survival_level = 0.3
-
-    eigenstructure = get_cached_boundary_dirichlet_modes(mesh, num_modes)
-    waves = eigenstructure.eigenvectors
-    ground_state = np.abs(waves[:, 0])
-    mesh.point_data["ground_state"] = ground_state
-    base_tone = np.sqrt(np.abs(waves[:, 0]))
-    # base_tone = np.abs(waves[:, 0])
+) -> pv.PolyData:
+    base_tone = np.sqrt(ground_state)
     waist_coat = big_width * (1 - 0.5 * base_tone)
-    mesh.point_data["waist_coat"] = waist_coat
-    # ww0 = rescale_range(interpolated_mode(eigenstructure, 0.8514231), -1, 1)
-    ww0 = eigenstructure.eigenvectors[:, 89]
-    # ww1 = rescale_range(interpolated_mode(eigenstructure, 0.94231), -1, 1)
-    ww = ww0
-    mesh.point_data["ww"] = ww
-    ww_rescaled = rescale_range(ww, -1.0, 1.0)
-    mesh.point_data["ww_rescaled"] = ww_rescaled
-    hunger_pattern = rescale_range(survival_level - np.square(ww_rescaled), -1, 1)
-    mesh.point_data["hunger_pattern"] = hunger_pattern
+    hunger_pattern = rescale_range(survival_level - np.square(wave), -1, 1)
     height_precollar = waist_coat * hunger_pattern
-    mesh.point_data["height_precollar"] = height_precollar
     cap_guarantee = np.clip(
         2 * min_thickness * (collar_guarantee_size - ground_state) + min_thickness,
         0.0,
         np.inf)
-    mesh.point_data["cap_guarantee"] = cap_guarantee
     height = np.maximum(height_precollar, cap_guarantee)
     mesh.point_data["height"] = height
+    extruded = extrude_triangles_to_wedges(
+        mesh,
+        offset_field_name="height",
+        min_thickness=min_thickness,
+        smoothing_iterations=20
+    )
+    smoothed = extruded.smooth(n_iter=smoothing_iterations)
+    normaled = smoothed.compute_normals(point_normals=True, cell_normals=False, auto_orient_normals=True, split_vertices=False)
+    return normaled
 
-    mesh.point_data["a0"] = waves[:, 0]
-    mesh.point_data["a1"] = waves[:, 1]
-    mesh.point_data["a2"] = waves[:, 2]
-    mesh.point_data["a3"] = waves[:, 3]
 
-    mesh.save("quilt.vtp")
-    extruded = extrude_triangles_to_wedges(mesh, offset_field_name="height", min_thickness=min_thickness)
-    extruded.save("waved.vtp")
-
-
-def test_new_backend():
+def test_cyl_0():
     mesh = pv.read("rook.obj")
-    operator = build_dirichlet_operator(mesh)
-    ms = SpectralShiftEigenSolver(operator.matrix, operator.support_mass)
-
-    import time
-    for sigma in [-1e-6, 0.8, 1.2, 1.4, 2.1]:
-        t = time.perf_counter()
-        w, phi = ms.solve(sigma, k=7)
-        dt = time.perf_counter() - t
-        print(f"sigma={sigma:9.3g}  {dt*1e3:7.1f} ms  eigenvalues: {np.round(w, 3)}")
+    waver = WaveGenerator(mesh)
+    ground_state = waver.generate_ground_mode()
+    ww = waver.generate_wave(11) + 0.3 * waver.generate_wave(21)
+    ww = rescale_range(ww, -1, 1)
+    rook = wave_to_rook(mesh=mesh, ground_state=ground_state, wave=ww)
+    rook.save("waved.vtp")
 
 
 if __name__ == "__main__":
-    test_new_backend()
+    test_cyl_0()
