@@ -5,8 +5,34 @@ import igl
 import pyvista as pv
 import vtk
 import scipy as sp
+import scipy.sparse.linalg as spla
 from dataclasses import dataclass
 import os
+import scipy.sparse.linalg as spla
+import pyamg  # Requires: pip install pyamg
+
+
+def fast_cpu_lobpcg_shifted(matrix, mass, spectral_shift, num_modes):
+    inverse_resolvant = matrix - spectral_shift * mass
+    ml = pyamg.smoothed_aggregation_solver(inverse_resolvant.tocsr())
+    preconditioner = ml.aspreconditioner()
+    initial_state = 1+np.random.rand(matrix.shape[0], num_modes)
+    vals, vecs = spla.lobpcg(matrix, initial_state, B=mass, M=preconditioner, largest=False, tol=1e-4, maxiter=500)
+    return vals, vecs
+
+
+# def fast_cpu_lobpcg_shifted(matrix, mass, spectral_shift, num_modes):
+#     vals, vecs = spla.eigs(matrix, k=num_modes, M=mass, which="SM", sigma=spectral_shift)
+#     return vals.real, vecs.real
+
+
+def solve_lobpcg_with_shift(matrix, mass, spectral_shift, num_modes):
+    inverse_resolvant = matrix - spectral_shift * mass
+    ilu = spla.spilu(inverse_resolvant.tocsc(), drop_tol=1e-3)
+    M_mat = spla.LinearOperator(matrix.shape, matvec=ilu.solve)
+    initial = np.random.rand(matrix.shape[0], num_modes)
+    vals, vecs = spla.lobpcg(inverse_resolvant, initial, B=mass, M=M_mat, largest=False, tol=1e-4, maxiter=350)
+    return vals, vecs
 
 
 def compute_moment_frame(mesh: pv.PolyData) -> np.ndarray:
@@ -78,20 +104,15 @@ def build_dirichlet_operator(mesh: pv.PolyData) -> LinearOperator:
     return linear_operator
 
 
-def compute_boundary_dirichlet_modes(mesh: pv.PolyData, num_modes: int, sigma: float = None) -> Eigenstructure:
+def compute_boundary_dirichlet_modes(mesh: pv.PolyData, num_modes: int, sigma: float = 0.0) -> Eigenstructure:
     operator = build_dirichlet_operator(mesh)
-
-    kwargs = {"k": num_modes, "M": operator.support_mass}
-    if sigma is not None:
-        kwargs["sigma"] = sigma
-        kwargs["which"] = "LM"
-    else:
-        kwargs["which"] = "SM"
-
     print(f"Computing {num_modes} modes on {mesh.n_points} vertices.")
-    eigenvalues, waves_supported = sp.sparse.linalg.eigs(
+    eigenvalues, waves_supported = spla.eigs(
         operator.matrix,
-        **kwargs)
+        k=num_modes,
+        M=operator.support_mass,
+        which="SM",
+        sigma=sigma)
 
     waves_prenormalized = np.zeros(shape=(mesh.n_points, num_modes))
     waves_prenormalized[operator.support_indices, :] = waves_supported.real
@@ -192,7 +213,7 @@ def weyl_estimate(area: float, boundary_length: float, nth_mode: int) -> float:
     return 4 * np.pi / area * nth_mode + 2 * np.sqrt(np.pi) * np.pow(area, -1.5) * boundary_length * np.sqrt(nth_mode)
 
 
-def weyl_gap_estimate(area: float, boundary_length: float, nth_mode: int) -> float:
+def weyl_gap_estimate(area: float, boundary_length: float, nth_mode: float) -> float:
     # Derivative of the Weyl estimate says dlambda_N \approx \frac{4\pi}{A} + \frac{2\sqrt{\pi} L}{A^{3/2}} \sqrt{N}
     return 4 * np.pi / area + np.sqrt(np.pi) * np.pow(area, -1.5) * boundary_length / np.sqrt(nth_mode)
 
@@ -231,13 +252,6 @@ def extrude_triangles_to_wedges(mesh: pv.PolyData, offset_field_name: str, min_t
     return ugrid.extract_surface(algorithm='geometry')
 
 
-def test_extrusion():
-    sphere = pv.Sphere(theta_resolution=8, phi_resolution=8, radius=1.0)
-    sphere.point_data["height"] = np.square(sphere.points[:, 2]) + 0.1 * sphere.points[:, 0]
-    zounds = extrude_triangles_to_wedges(sphere, offset_field_name="height", min_thickness=0.1618)
-    zounds.save("zounds.vtp")
-
-
 def rescale_range(xx: np.ndarray, range_low: float, range_hi: float) -> np.ndarray:
     low_xx = xx.min()
     high_xx = xx.max()
@@ -246,9 +260,104 @@ def rescale_range(xx: np.ndarray, range_low: float, range_hi: float) -> np.ndarr
     return rescaled
 
 
+def rescale_range_per_column(xx: np.ndarray, range_low: float, range_hi: float) -> np.ndarray:
+    low_xx = xx.min(axis=0, keepdims=True)
+    high_xx = xx.max(axis=0, keepdims=True)
+    diff = high_xx - low_xx
+    # Avoid division by zero if a column is constant
+    diff = np.where(diff == 0, 1.0, diff)
+    slope = (range_hi - range_low) / diff
+    rescaled = slope * (xx - low_xx) + range_low
+    return rescaled
+
+
+class WaveGenerator:
+    def __init__(self, mesh: pv.Polydata):
+        self.num_vertices = mesh.n_points
+        self.area = mesh.area
+        boundary_edges = mesh.extract_feature_edges(boundary_edges=True, feature_edges=False, manifold_edges=False)
+        boundary_edges = boundary_edges.compute_cell_sizes()
+        self.boundary_measure = boundary_edges["Length"].sum()
+        self.operator = build_dirichlet_operator(mesh)
+
+    def supported_to_full_field(self, supported_field: np.ndarray) -> np.ndarray:
+        full_shape = list(supported_field.shape)
+        full_shape[0] = self.num_vertices
+        field = np.zeros(shape=full_shape)
+        field[self.operator.support_indices, :] = supported_field
+        return field
+
+    def generate_ground_mode(self) -> np.ndarray:
+        # ground_energy, ground_state_complex = sp.sparse.linalg.eigs(
+        #     self.operator.matrix,
+        #     k=1,
+        #     M=self.operator.support_mass,
+        #     which="SM")
+        ground_energy, ground_state_complex = fast_cpu_lobpcg_shifted(
+            matrix=self.operator.matrix,
+            mass=self.operator.support_mass,
+            spectral_shift=0.0,
+            num_modes=1
+        )
+        ground_state = ground_state_complex.real
+        if ground_state.sum() < 0:
+            ground_state *= -1
+        ground_state_rescaled = rescale_range(self.supported_to_full_field(ground_state),
+                                              0.0,
+                                              1.0)
+        return ground_state_rescaled
+
+    def generate_wave(self, mode_rank: float) -> np.ndarray:
+        spectral_shift = weyl_estimate(self.area, self.boundary_measure, mode_rank)
+        eigenvalues_complex, modes_complex = fast_cpu_lobpcg_shifted(
+            self.operator.matrix,
+            mass=self.operator.support_mass,
+            spectral_shift=spectral_shift,
+            num_modes=7,
+        )
+        eigenvalues = eigenvalues_complex.real
+        modes = rescale_range_per_column(modes_complex.real, -1.0, 1.0)
+        #TODO canonicalize the mode signs
+        weyl_gap = weyl_gap_estimate(self.area, self.boundary_measure, mode_rank)
+        decay_rate = -1.0 / (weyl_gap * weyl_gap)
+        weights_prenormalized = np.exp(decay_rate * np.square((eigenvalues - spectral_shift)))
+        weights = weights_prenormalized / np.sum(weights_prenormalized)
+        print(f"eigenvalues: {eigenvalues}")
+        print(f"weyl_gap: {weyl_gap}")
+        print(f"Weights: {weights}")
+        wave_prenormalized = modes @ weights
+        wave = rescale_range(wave_prenormalized, -1.0, 1.0)
+        return self.supported_to_full_field(wave)
+
+    def generate_pure_mode(self, mode_rank: float) -> np.ndarray:
+        spectral_shift = weyl_estimate(self.area, self.boundary_measure, mode_rank)
+        eigenvalues_complex, modes_complex =fast_cpu_lobpcg_shifted(
+            self.operator.matrix,
+            num_modes=1,
+            mass=self.operator.support_mass,
+            spectral_shift=spectral_shift)
+        #TODO canonicalize the mode signs
+        mode = rescale_range_per_column(modes_complex.real, -1.0, 1.0)
+        return self.supported_to_full_field(mode)
+
+
+
+def test_generator():
+    mesh = pv.read("rook.obj")
+    gen = WaveGenerator(mesh)
+    # ground_state = gen.generate_ground_mode()
+    # mesh.point_data["ground_state"] = ground_state
+    wave89 = gen.generate_wave(89)
+    mesh.point_data["wave89"] = wave89
+    # pure89 = gen.generate_pure_mode(89)
+    # mesh.point_data["pure89"] = pure89
+    mesh.save("generated.vtp")
+
+
+
 def test_cyl_0():
     mesh = pv.read("rook.obj")
-    num_modes = 456
+    num_modes = 300
     big_width = 5.0
     min_thickness = 0.6
     collar_guarantee_size = 0.35
