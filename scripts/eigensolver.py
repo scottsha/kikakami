@@ -1,11 +1,9 @@
-import sys, time
 import numpy as np
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
-import igl
 
 
-class ShiftInvertSolver:
+class SpectralShiftFactorizer:
     """Solves (A - sigma*I) x = b, reusing the symbolic factorization across shifts."""
 
     def __init__(self, A, backend="auto"):
@@ -25,17 +23,17 @@ class ShiftInvertSolver:
                     self.backend = "pardiso"
                 except ImportError:
                     self.backend = "splu"
-        print(f"[ShiftInvertSolver] backend = {self.backend}")
+        print(f"[SpectralShiftFactorizer] backend = {self.backend}")
 
-    def set_shift(self, sigma):
-        S = (self.A - sigma * self.I).tocsc()
+    def set_shift(self, spectral_shift):
+        S = (self.A - spectral_shift * self.I).tocsc()
 
         if self.backend == "cholmod":
             from sksparse.cholmod import analyze
             # SPD when sigma < 0 -> fast supernodal LL^T.
             # Indefinite when sigma > 0 -> simplicial LDL^T (no pivoting; fine near-shift
             # for most meshes, use PARDISO if you see instability).
-            mode = "supernodal" if sigma < 0 else "simplicial"
+            mode = "supernodal" if spectral_shift < 0 else "simplicial"
             if mode not in self._factors:
                 self._factors[mode] = analyze(S, mode=mode)   # symbolic: done once per mode
             f = self._factors[mode]
@@ -59,28 +57,24 @@ class ShiftInvertSolver:
                                    dtype=np.float64)
 
 
-class MeshEigenSolver:
-    def __init__(self, V, F, backend="auto"):
-        L = igl.cotmatrix(V, F)                                    # negative semidefinite
-        M = igl.massmatrix(V, F, igl.MASSMATRIX_TYPE_VORONOI)      # diagonal
-        A = -L
-        m = M.diagonal()
-        self.minv_sqrt = 1.0 / np.sqrt(m)
+class SpectralShiftEigenSolver:
+    def __init__(self, matrix, mass, backend="auto"):
+        m_diagonal = mass.diagonal()
+        self.minv_sqrt = 1.0 / np.sqrt(m_diagonal)
         D = sp.diags(self.minv_sqrt)
-        self.A_std = (D @ A @ D).tocsc()                           # M^-1/2 A M^-1/2
-        self.A_std = (self.A_std + self.A_std.T) * 0.5             # clean up round-off asymmetry
-        self.solver = ShiftInvertSolver(self.A_std, backend)
+        self.symmetrized_operator = (D @ matrix @ D).tocsc()
+        self.symmetrized_operator = (self.symmetrized_operator + self.symmetrized_operator.T) * 0.5
+        self.factorizer = SpectralShiftFactorizer(self.symmetrized_operator, backend)
         self._v0 = None
 
     def solve(self, sigma, k=7, tol=1e-6, ncv=None, warm_start=True):
         if sigma == 0.0:
-            sigma = -1e-6                                          # avoid exact singularity
-        self.solver.set_shift(sigma)
-        n = self.A_std.shape[0]
+            sigma = 1e-6
+        self.factorizer.set_shift(sigma)
         ncv = ncv or max(2 * k + 1, 16)
         vals, vecs = spla.eigsh(
-            self.A_std, k=k, sigma=sigma, which="LM",
-            OPinv=self.solver.as_linear_operator(),
+            self.symmetrized_operator, k=k, sigma=sigma, which="LM",
+            OPinv=self.factorizer.as_linear_operator(),
             tol=tol, ncv=ncv,
             v0=self._v0 if warm_start else None,
         )
@@ -89,16 +83,3 @@ class MeshEigenSolver:
         idx = np.argsort(vals)
         vals, vecs = vals[idx], vecs[:, idx]
         return vals, vecs * self.minv_sqrt[:, None]                # back to M-orthonormal modes
-
-
-if __name__ == "__main__":
-    V, F = igl.read_triangle_mesh("rook.obj")
-    print(f"mesh: {V.shape[0]} verts, {F.shape[0]} faces")
-
-    ms = MeshEigenSolver(V, F)
-
-    for sigma in [-1e-6, 5.0, 50.0, 200.0, 1000.0]:
-        t = time.perf_counter()
-        w, phi = ms.solve(sigma, k=7)
-        dt = time.perf_counter() - t
-        print(f"sigma={sigma:9.3g}  {dt*1e3:7.1f} ms  eigenvalues: {np.round(w, 3)}")

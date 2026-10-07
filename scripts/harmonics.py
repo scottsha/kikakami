@@ -1,5 +1,3 @@
-from os import supports_fd
-
 import numpy as np
 import igl
 import pyvista as pv
@@ -10,6 +8,8 @@ from dataclasses import dataclass
 import os
 import scipy.sparse.linalg as spla
 import pyamg  # Requires: pip install pyamg
+
+from eigensolver import SpectralShiftFactorizer, SpectralShiftEigenSolver
 
 
 def fast_cpu_lobpcg_shifted(matrix, mass, spectral_shift, num_modes):
@@ -96,7 +96,7 @@ def build_dirichlet_operator(mesh: pv.PolyData) -> LinearOperator:
     boundary_vertices = set([vv for loop in loops for vv in loop])
     interior_verties = [foo for foo in range(0, mesh.n_points) if foo not in boundary_vertices]
     full_cot = igl.cotmatrix(mesh.points, triangle_vertices)
-    full_mass = igl.massmatrix(mesh.points, triangle_vertices)
+    full_mass = igl.massmatrix(mesh.points, triangle_vertices, igl.MASSMATRIX_TYPE_VORONOI)
     linear_operator = LinearOperator(
         support_indices=interior_verties,
         matrix=-full_cot.tocsr()[interior_verties, :].tocsc()[:, interior_verties],
@@ -400,5 +400,18 @@ def test_cyl_0():
     extruded.save("waved.vtp")
 
 
+def test_new_backend():
+    mesh = pv.read("rook.obj")
+    operator = build_dirichlet_operator(mesh)
+    ms = SpectralShiftEigenSolver(operator.matrix, operator.support_mass)
+
+    import time
+    for sigma in [-1e-6, 0.8, 1.2, 1.4, 2.1]:
+        t = time.perf_counter()
+        w, phi = ms.solve(sigma, k=7)
+        dt = time.perf_counter() - t
+        print(f"sigma={sigma:9.3g}  {dt*1e3:7.1f} ms  eigenvalues: {np.round(w, 3)}")
+
+
 if __name__ == "__main__":
-    test_cyl_0()
+    test_new_backend()
