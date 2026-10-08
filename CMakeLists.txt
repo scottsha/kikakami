@@ -17,12 +17,12 @@ add_library(
         src/eigenmesh.h
         src/axis_aligned_grid.cpp
         src/axis_aligned_grid.h
-#        src/boundary_edge_normal_filter.cpp
-#        src/boundary_edge_normal_filter.h
-#        src/boundary_loop_arclength_locator.cpp
-#        src/boundary_loop_arclength_locator.h
-#        src/clipper2_translation.cpp
-#        src/clipper2_translation.h
+        src/boundary_edge_normal_filter.cpp
+        src/boundary_edge_normal_filter.h
+        src/boundary_loop_arclength_locator.cpp
+        src/boundary_loop_arclength_locator.h
+        src/clipper2_translation.cpp
+        src/clipper2_translation.h
 #        src/conformal_coordinate_charter.cpp
 #        src/conformal_coordinate_charter.h
 #        src/coordinate_chart_interpolater.cpp
@@ -55,8 +55,8 @@ add_library(
 #        src/geodesic_utils.cpp
 #        src/geodesic_utils.h
 #        src/kikakami_json_utils.h
-#        src/kikakami_utils.cpp
-#        src/kikakami_utils.h
+        src/kikakami_utils.cpp
+        src/kikakami_utils.h
 #        src/kikakami_vtk_utils.cpp
 #        src/kikakami_vtk_utils.h
 #        src/harmonic_coordinate_charter.cpp
@@ -115,9 +115,14 @@ add_library(
 )
 
 target_link_libraries(kikakami PUBLIC
+        Clipper2::clipper2
         Eigen3::Eigen
         igl::igl
         igl::common
+#        autodiff
+        nlohmann_json::nlohmann_json
+#        ${OpenCASCADE_LIBRARIES}
+        Spectra::Spectra
         ${VTK_LIBRARIES}
 )
 
