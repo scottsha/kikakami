@@ -3,36 +3,12 @@ import igl
 import pyvista as pv
 import vtk
 import scipy as sp
-import scipy.sparse.linalg as spla
 from dataclasses import dataclass
 import os
 import scipy.sparse.linalg as spla
-import pyamg  # Requires: pip install pyamg
+from scipy.stats import qmc
 
 from eigensolver import SpectralShiftFactorizer, SpectralShiftEigenSolver
-
-
-def fast_cpu_lobpcg_shifted(matrix, mass, spectral_shift, num_modes):
-    inverse_resolvant = matrix - spectral_shift * mass
-    ml = pyamg.smoothed_aggregation_solver(inverse_resolvant.tocsr())
-    preconditioner = ml.aspreconditioner()
-    initial_state = 1 + np.random.rand(matrix.shape[0], num_modes)
-    vals, vecs = spla.lobpcg(matrix, initial_state, B=mass, M=preconditioner, largest=False, tol=1e-4, maxiter=500)
-    return vals, vecs
-
-
-# def fast_cpu_lobpcg_shifted(matrix, mass, spectral_shift, num_modes):
-#     vals, vecs = spla.eigs(matrix, k=num_modes, M=mass, which="SM", sigma=spectral_shift)
-#     return vals.real, vecs.real
-
-
-def solve_lobpcg_with_shift(matrix, mass, spectral_shift, num_modes):
-    inverse_resolvant = matrix - spectral_shift * mass
-    ilu = spla.spilu(inverse_resolvant.tocsc(), drop_tol=1e-3)
-    M_mat = spla.LinearOperator(matrix.shape, matvec=ilu.solve)
-    initial = np.random.rand(matrix.shape[0], num_modes)
-    vals, vecs = spla.lobpcg(inverse_resolvant, initial, B=mass, M=M_mat, largest=False, tol=1e-4, maxiter=350)
-    return vals, vecs
 
 
 def compute_moment_frame(mesh: pv.PolyData) -> np.ndarray:
@@ -65,11 +41,15 @@ def compute_moment_frame(mesh: pv.PolyData) -> np.ndarray:
     return sorted_eigenvectors
 
 
-def canonicalize_mode_signs(mesh: pv.PolyData, modes: np.ndarray) -> np.ndarray:
+def build_sign_test_function(mesh: pv.PolyData) -> np.ndarray:
     frame = compute_moment_frame(mesh)
     centered = mesh.points - mesh.points.mean(axis=0)
     cannon_coords = centered @ frame
     test_function = 1 / (1 + np.exp(1 - cannon_coords @ np.array([np.pi, np.sqrt(2), 1])))
+    return test_function
+
+def canonicalize_mode_signs(mesh: pv.PolyData, modes: np.ndarray) -> np.ndarray:
+    test_function = build_sign_test_function(mesh)
     triangle_vertices = mesh.faces.reshape((-1, 4))[:, 1:]
     mass = igl.massmatrix(mesh.points, triangle_vertices)
     signs = np.sign(test_function.transpose() @ mass @ modes)
@@ -113,7 +93,6 @@ def compute_boundary_dirichlet_modes(mesh: pv.PolyData, num_modes: int, sigma: f
         M=operator.support_mass,
         which="SM",
         sigma=sigma)
-
     waves_prenormalized = np.zeros(shape=(mesh.n_points, num_modes))
     waves_prenormalized[operator.support_indices, :] = waves_supported.real
     linf_norms = np.linalg.norm(waves_prenormalized, ord=np.inf, axis=0, keepdims=True)
@@ -200,7 +179,6 @@ def get_cached_boundary_dirichlet_modes(mesh: pv.PolyData, num_modes: int) -> Ei
 def interpolated_mode(eig: Eigenstructure, relative_eigenmode: float) -> np.ndarray:
     est_eigenmode = (1 - relative_eigenmode) * eig.eigenvalues[0] + relative_eigenmode * eig.eigenvalues[-1]
     decay_rate = 0.5 * np.square(eig.eigenvalues.size / (eig.eigenvalues[-1] - eig.eigenvalues[0]))
-    print("DECAY RATE:", decay_rate)
     weights = np.exp(-decay_rate * np.square(eig.eigenvalues - est_eigenmode))
     weights /= np.sum(weights)
     print(weights)
@@ -282,6 +260,7 @@ class WaveGenerator:
         self.boundary_measure = boundary_edges["Length"].sum()
         self.operator = build_dirichlet_operator(mesh)
         self.solver = SpectralShiftEigenSolver(self.operator.matrix, self.operator.support_mass)
+        self.test_function = build_sign_test_function(mesh)[self.operator.support_indices]
 
     def supported_to_full_field(self, supported_field: np.ndarray) -> np.ndarray:
         full_shape = list(supported_field.shape)
@@ -290,11 +269,8 @@ class WaveGenerator:
         field[self.operator.support_indices, :] = supported_field
         return field
 
-    def sign_by_skewness(self, modes: np.ndarray) -> np.ndarray:
-        skewness =  (self.operator.support_mass @ np.power(modes, 3)).sum(axis=0)
-        print(f"Skewness: {skewness}")
-        signs = np.sign(skewness)
-        print(f"signs: {signs}")
+    def set_mode_signs(self, modes: np.ndarray) -> np.ndarray:
+        signs = np.sign(self.test_function.transpose() @ self.operator.support_mass @ modes)
         signed_modes = modes * signs
         return signed_modes
 
@@ -309,30 +285,23 @@ class WaveGenerator:
 
     def generate_pure_mode(self, mode_rank: float) -> np.ndarray:
         spectral_shift = weyl_estimate(self.area, self.boundary_measure, mode_rank)
-        eigenvalues_complex, modes = self.solver.solve(spectral_shift, k=1)
-        # TODO canonicalize the mode signs
-        mode = rescale_range(modes, -1.0, 1.0)
-        signed_mode = self.sign_by_skewness(mode)
-        return self.supported_to_full_field(signed_mode)
+        eigenvalues_complex, mode = self.solver.solve(spectral_shift, k=1)
+        mode = mode / np.abs(mode).max()
+        mode = self.set_mode_signs(mode)
+        return self.supported_to_full_field(mode)
 
-    def generate_wave(self, mode_rank: float) -> np.ndarray:
+    def generate_wave(self, mode_rank: float, weight_sharpness:float = 1.0) -> np.ndarray:
         spectral_target = weyl_estimate(self.area, self.boundary_measure, mode_rank)
         eigenvalues, modes_raw = self.solver.solve(spectral_target, k=7)
-        modes = rescale_range_per_column(modes_raw, -1.0, 1.0)
-        modes = self.sign_by_skewness(modes)
-        # TODO canonicalize the mode signs
+        mode_scaled = modes_raw / np.abs(modes_raw).max(axis=0, keepdims=True)
+        modes = self.set_mode_signs(mode_scaled)
         weyl_gap = weyl_gap_estimate(self.area, self.boundary_measure, mode_rank)
-        print(f"spectral_target: {spectral_target}")
         off_target = (eigenvalues - spectral_target)
-        print(f"eigenvalues: {eigenvalues}")
-        print(f"weyl_gap: {weyl_gap}")
-        print(f"off_target: {off_target}")
-        weights_prenormalized = np.exp(-1.5 * np.square(off_target / weyl_gap))
+        weights_prenormalized = np.exp(-2 * weight_sharpness * np.square(off_target / weyl_gap))
         weights = weights_prenormalized / np.sum(weights_prenormalized)
-        print(f"Weights: {weights}")
         wave_prenormalized = modes @ weights[:, np.newaxis]
-        wave = rescale_range(wave_prenormalized, -1.0, 1.0)
-        return self.supported_to_full_field(wave)
+        full_wave = self.supported_to_full_field(wave_prenormalized)
+        return full_wave
 
 
 def test_generator():
@@ -340,14 +309,13 @@ def test_generator():
     gen = WaveGenerator(mesh)
     ground_state = gen.generate_ground_mode()
     mesh.point_data["ground_state"] = ground_state
-    wave89 = gen.generate_wave(89)
-    mesh.point_data["wave89"] = wave89
-    pure89 = gen.generate_pure_mode(89)
-    mesh.point_data["pure89"] = pure89
-    wave1889 = gen.generate_wave(1889)
-    mesh.point_data["wave1889"] = wave1889
-    pure1889 = gen.generate_pure_mode(1889)
-    mesh.point_data["pure1889"] = pure1889
+    mesh.point_data["s0"] = gen.generate_pure_mode(0.0)
+    mesh.point_data["s1"] = gen.generate_pure_mode(1.0)
+    mesh.point_data["s2"] = gen.generate_pure_mode(2.0)
+    mesh.point_data["s3"] = gen.generate_pure_mode(3.0)
+    for ii in range(1, 10):
+        wave1 = gen.generate_wave(0.2*ii)
+        mesh.point_data["wave{}".format(ii)] = wave1
     mesh.save("generated.vtp")
 
 
@@ -377,7 +345,8 @@ def wave_to_rook(
         min_thickness=min_thickness,
         smoothing_iterations=20
     )
-    smoothed = extruded.smooth(n_iter=smoothing_iterations)
+    biggest = extruded.extract_largest()
+    smoothed = biggest.smooth(n_iter=smoothing_iterations)
     normaled = smoothed.compute_normals(point_normals=True, cell_normals=False, auto_orient_normals=True, split_vertices=False)
     return normaled
 
@@ -392,5 +361,23 @@ def test_cyl_0():
     rook.save("waved.vtp")
 
 
+def suggested_sampler():
+    mesh = pv.read("rook.obj")
+    print("Building generator")
+    mode_rank_limit = mesh.n_points / 28
+    lower_bounds = [1.0,  15.0, -.3]
+    upper_bounds = [0.3 * mode_rank_limit, mode_rank_limit, .3]
+    sampler = qmc.Sobol(d=3)
+    num_samples = 100
+    samples_prescaled = sampler.random(num_samples)
+    samples = qmc.scale(samples_prescaled, lower_bounds, upper_bounds)
+    waver = WaveGenerator(mesh)
+    ground_state=waver.generate_ground_mode()
+    for foo, sample in enumerate(samples):
+        print("Sample {}".format(foo))
+        wave = waver.generate_wave(sample[0]) + sample[2] * waver.generate_wave(sample[1])
+        rook = wave_to_rook(mesh=mesh, ground_state=ground_state, wave=wave)
+        rook.save(f"generated/rook_{foo}.vtp")
+
 if __name__ == "__main__":
-    test_cyl_0()
+    suggested_sampler()
