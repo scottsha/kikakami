@@ -331,7 +331,8 @@ def wave_to_rook(
 ) -> pv.PolyData:
     base_tone = np.sqrt(ground_state)
     waist_coat = big_width * (1 - 0.5 * base_tone)
-    hunger_pattern = rescale_range(survival_level - np.square(wave), -1, 1)
+    sq_wave = rescale_range(np.square(wave), 0.0, 1.0)
+    hunger_pattern = rescale_range(survival_level - sq_wave, -1, 1)
     height_precollar = waist_coat * hunger_pattern
     cap_guarantee = np.clip(
         2 * min_thickness * (collar_guarantee_size - ground_state) + min_thickness,
@@ -365,9 +366,9 @@ def suggested_sampler():
     mesh = pv.read("rook.obj")
     print("Building generator")
     mode_rank_limit = mesh.n_points / 28
-    lower_bounds = [1.0,  15.0, -.3]
-    upper_bounds = [0.3 * mode_rank_limit, mode_rank_limit, .3]
-    sampler = qmc.Sobol(d=3)
+    lower_bounds = [1.0,  15.0, -.3, 0.3]
+    upper_bounds = [0.3 * mode_rank_limit, mode_rank_limit, .3, 0.8]
+    sampler = qmc.Sobol(d=4)
     num_samples = 100
     samples_prescaled = sampler.random(num_samples)
     samples = qmc.scale(samples_prescaled, lower_bounds, upper_bounds)
@@ -376,7 +377,7 @@ def suggested_sampler():
     for foo, sample in enumerate(samples):
         print("Sample {}".format(foo))
         wave = waver.generate_wave(sample[0]) + sample[2] * waver.generate_wave(sample[1])
-        rook = wave_to_rook(mesh=mesh, ground_state=ground_state, wave=wave)
+        rook = wave_to_rook(mesh=mesh, ground_state=ground_state, wave=wave, survival_level=sample[3])
         rook.save(f"generated/rook_{foo}.vtp")
 
 if __name__ == "__main__":
